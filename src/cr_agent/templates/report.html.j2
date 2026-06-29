@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ record.request.app_name }} 大模型扫描报告</title>
+  <style>
+    body { font-family: "PingFang SC", "Microsoft YaHei", sans-serif; margin: 32px; color: #1f2937; background: #f8fafc; }
+    .page-actions { max-width: 1200px; margin: 0 0 12px auto; text-align: right; }
+    .card { background: #fff; border-radius: 12px; padding: 24px; margin-bottom: 20px; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08); }
+    h1, h2 { margin-top: 0; }
+    .meta { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .ok { color: #15803d; }
+    .bad { color: #b91c1c; }
+    .finding { border-top: 1px solid #e5e7eb; padding: 16px 0; }
+    .severity { font-weight: 700; text-transform: uppercase; display:inline-block; margin-right:8px; }
+    .status-tag { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; background:#eef2ff; color:#3949ab; }
+    .status-tag.processing { background:#fff7ed; color:#c2410c; }
+    .muted { color: #64748b; }
+    .feedback-box { display:none; margin-top:12px; border:1px solid #e5e7eb; border-radius:12px; padding:16px; background:#fbfdff; }
+    .feedback-item { padding:10px 12px; border-radius:10px; margin-bottom:10px; }
+    .feedback-item.user { background:#eef4ff; }
+    .feedback-item.model { background:#f4f7f9; }
+    .feedback-actions { display:flex; gap:10px; margin-top:10px; }
+    .feedback-actions button { border:none; border-radius:8px; padding:8px 14px; cursor:pointer; }
+    .toggle-btn { background:#e2e8f0; color:#0f172a; }
+    .submit-btn { background:#2563eb; color:#fff; }
+    .top-btn { border:none; border-radius:10px; padding:10px 14px; cursor:pointer; background:#0f766e; color:#fff; }
+    textarea { width:100%; min-height:88px; border:1px solid #cbd5e1; border-radius:10px; padding:12px; resize:vertical; font:inherit; box-sizing:border-box; }
+    code { background: #eff6ff; padding: 2px 6px; border-radius: 6px; }
+    a { color: #2563eb; }
+    .modal { display:none; position:fixed; inset:0; background:rgba(15,23,42,.35); padding:48px 16px; overflow:auto; }
+    .modal-card { max-width:720px; margin:0 auto; background:#fff; border-radius:16px; padding:24px; box-shadow:0 24px 60px rgba(15,23,42,.25); }
+  </style>
+</head>
+<body>
+  <div class="page-actions">
+    <button class="top-btn" type="button" onclick="toggleFixModal(true)">一键修复</button>
+    <button class="top-btn" type="button" onclick="toggleGeneralFeedbackModal(true)">其他反馈（漏判）</button>
+  </div>
+  <div class="card">
+    <h1>{{ record.request.app_name }} 大模型扫描报告</h1>
+    <div class="meta">
+      <div>任务ID: <code>{{ record.task_id }}</code></div>
+      <div>分支: <code>{{ record.request.branch }}</code></div>
+      <div>提交: <code>{{ record.request.commit_id or "N/A" }}</code></div>
+      <div>报告生成时间: <span id="generated-at" data-value="{{ record.updated_at.isoformat() if record.updated_at else '' }}"></span></div>
+      <div>状态:
+        <span id="pass-check" class="{% if result.pass_check %}ok{% else %}bad{% endif %}">
+          {% if result.pass_check %}通过{% else %}未通过{% endif %}
+        </span>
+      </div>
+      <div>评分: <strong id="score">{{ result.score }}</strong></div>
+      <div>触发来源: {{ record.request.trigger_source }}</div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>摘要</h2>
+    <p id="summary">{{ result.summary }}</p>
+  </div>
+  <div class="card">
+    <h2>问题列表</h2>
+    <div id="findings-root">
+      <p class="muted">加载中...</p>
+    </div>
+  </div>
+  <div class="modal" id="general-feedback-modal">
+    <div class="modal-card">
+      <h2>其他反馈（漏判）</h2>
+      <p class="muted">如果你认为报告漏掉了本次变更真正引入的问题，可在这里补充描述，系统会交给大模型复核。确认成立后会归档到 issue 目录。</p>
+      <div id="general-feedback-list" class="muted" style="margin-bottom:12px;">暂无历史反馈</div>
+      <textarea id="general-feedback-input" placeholder="请描述你认为漏判的问题、相关代码位置、风险点，以及为什么它属于本次变更引入的问题。"></textarea>
+      <div class="feedback-actions">
+        <button class="submit-btn" type="button" onclick="submitGeneralFeedback()">提交漏判反馈</button>
+        <button class="toggle-btn" type="button" onclick="toggleGeneralFeedbackModal(false)">关闭</button>
+      </div>
+    </div>
+  </div>
+  <div class="modal" id="fix-modal">
+    <div class="modal-card">
+      <h2>一键修复</h2>
+      <p class="muted">先勾选要修复的问题，然后和大模型多轮确认修复范围、边界与方案。确认后系统会在独立工作区执行修复、二次复核并提交 MR。</p>
+      <div id="fix-selection" style="margin-bottom:12px;"></div>
+      <div id="fix-session-summary" class="muted" style="margin-bottom:12px;">暂无修复会话</div>
+      <div id="fix-session-list" style="max-height:260px; overflow:auto; margin-bottom:12px;"></div>
+      <textarea id="fix-message-input" placeholder="请补充你希望本轮修复关注的范围、边界和约束。第一次提交时如果留空，模型会先主动和你确认范围。"></textarea>
+      <div class="feedback-actions">
+        <button class="toggle-btn" type="button" onclick="startNewFixSession()">新建修复会话</button>
+        <button class="submit-btn" type="button" onclick="submitFixMessage()">提交给大模型</button>
+        <button class="toggle-btn" type="button" onclick="toggleFixModal(false)">关闭</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    const taskId = {{ record.task_id|tojson }};
+    let latestDetail = null;
+    let activeFixSessionId = null;
+    let uiState = {
+      expanded: new Set(),
+      drafts: {},
+      focus: null,
+      scrollY: 0,
+    };
+
+    function escapeHtml(value) {
+      return (value || '').replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+    }
+
+    function formatShanghaiTime(value) {
+      if (!value) return '';
+      return new Intl.DateTimeFormat('zh-CN', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      }).format(new Date(value));
+    }
+
+    function renderThread(messages) {
+      if (!messages || !messages.length) {
+        return '<div class="muted">暂无沟通记录</div>';
+      }
+      return messages.map(item => `
+        <div class="feedback-item ${item.role}">
+          <div><strong>${item.role === 'user' ? '用户' : '模型'}</strong> <span class="muted">${formatShanghaiTime(item.created_at) || ''}</span></div>
+          <div>${escapeHtml(item.content)}</div>
+        </div>
+      `).join('');
+    }
+
+    function renderGeneralFeedbackList(items) {
+      if (!items || !items.length) {
+        return '<div class="muted">暂无历史反馈</div>';
+      }
+      return items.map(item => {
+        const status = item.processing ? '模型复核中' : (item.confirmed === true ? '已确认漏判' : item.confirmed === false ? '未采纳' : '待处理');
+        return `
+          <div class="feedback-item model">
+            <div><strong>${status}</strong> <span class="muted">${formatShanghaiTime(item.created_at) || ''}</span></div>
+            <div>${escapeHtml(item.content)}</div>
+            ${item.reply ? `<div style="margin-top:8px;"><strong>模型回复：</strong>${escapeHtml(item.reply)}</div>` : ''}
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderFixSelection(detail) {
+      const candidates = (detail.findings || []).filter(item => item.status !== 'resolved_model_false_positive');
+      if (!candidates.length) {
+        return '<div class="muted">当前没有可修复的问题。</div>';
+      }
+      return candidates.map(item => `
+        <label style="display:block; margin-bottom:8px;">
+          <input type="checkbox" class="fix-checkbox" value="${item.index}" ${isFixSelectedByDefault(item.index) ? 'checked' : ''} />
+          <strong>${escapeHtml(item.title)}</strong>
+          <span class="muted">(${item.effective_severity || item.original_severity})</span>
+        </label>
+      `).join('');
+    }
+
+    function renderFixSessions(items) {
+      if (!items || !items.length) {
+        return '<div class="muted">暂无修复会话</div>';
+      }
+      return items.map(item => `
+        <div class="feedback-box" id="fix-session-box-${item.session_id}" style="display:block; margin-bottom:12px; border-color:${item.session_id === activeFixSessionId ? '#2563eb' : '#e5e7eb'};">
+          <div><strong>${item.stage_label}</strong> <span class="muted">${formatShanghaiTime(item.updated_at) || ''}</span></div>
+          <div class="muted">问题范围: ${escapeHtml((item.selected_finding_titles || []).join('；') || '暂无')}</div>
+          ${item.target_repo_url ? `<div><strong>目标仓库：</strong><code>${escapeHtml(item.target_repo_url)}</code></div>` : ''}
+          ${item.target_branch ? `<div><strong>目标分支：</strong><code>${escapeHtml(item.target_branch)}</code></div>` : ''}
+          ${item.scope_summary ? `<div><strong>范围摘要：</strong>${escapeHtml(item.scope_summary)}</div>` : ''}
+          ${item.plan_summary ? `<div><strong>方案摘要：</strong>${escapeHtml(item.plan_summary)}</div>` : ''}
+          ${item.last_result ? `<div><strong>结果：</strong>${escapeHtml(item.last_result)}</div>` : ''}
+          ${item.source_branch ? `<div><strong>修复分支：</strong><code>${escapeHtml(item.source_branch)}</code></div>` : ''}
+          ${item.merge_request_url ? `<div><strong>MR：</strong><a href="${item.merge_request_url}" target="_blank" rel="noopener">${item.merge_request_url}</a></div>` : ''}
+          <div style="margin-top:8px;">${renderThread(item.messages)}</div>
+          <div class="feedback-actions">
+            <button class="toggle-btn" type="button" onclick="activateFixSession('${item.session_id}')">切换到此会话</button>
+            ${item.stage === 'failed' ? `<button class="submit-btn" type="button" onclick="retryFixSession('${item.session_id}')">重新尝试</button>` : ''}
+            ${item.stage === 'awaiting_user_confirmation' ? `<button class="submit-btn" type="button" onclick="confirmFixSession('${item.session_id}')">确认通过</button>` : ''}
+          </div>
+        </div>
+      `).join('');
+    }
+
+    function isFixSelectedByDefault(index) {
+      if (!latestDetail) return true;
+      if (activeFixSessionId) {
+        const active = (latestDetail.fix_sessions || []).find(item => item.session_id === activeFixSessionId);
+        if (active) return (active.selected_finding_indexes || []).includes(index);
+      }
+      return true;
+    }
+
+    function getSelectedFixIndexes() {
+      return Array.from(document.querySelectorAll('.fix-checkbox:checked')).map(item => Number(item.value));
+    }
+
+    function activateFixSession(sessionId) {
+      activeFixSessionId = sessionId;
+      refreshFixModal();
+    }
+
+    function toggleFixModal(show) {
+      document.getElementById('fix-modal').style.display = show ? 'block' : 'none';
+      if (show) refreshFixModal();
+    }
+
+    function startNewFixSession() {
+      activeFixSessionId = null;
+      refreshFixModal();
+    }
+
+    function refreshFixModal() {
+      if (!latestDetail) return;
+      if (!activeFixSessionId && latestDetail.fix_sessions && latestDetail.fix_sessions.length) {
+        activeFixSessionId = [...latestDetail.fix_sessions].sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')))[0].session_id;
+      }
+      document.getElementById('fix-selection').innerHTML = renderFixSelection(latestDetail);
+      const active = (latestDetail.fix_sessions || []).find(item => item.session_id === activeFixSessionId);
+      document.getElementById('fix-session-summary').textContent = active
+        ? `当前会话: ${active.stage_label}${active.processing ? '（处理中）' : ''}`
+        : '将创建新的修复会话';
+      document.getElementById('fix-session-list').innerHTML = renderFixSessions(latestDetail.fix_sessions || []);
+      scrollFixModalToLatest();
+    }
+
+    function scrollFixModalToLatest() {
+      const modal = document.getElementById('fix-modal');
+      if (!modal || modal.style.display !== 'block' || !activeFixSessionId) return;
+      const list = document.getElementById('fix-session-list');
+      const box = document.getElementById(`fix-session-box-${activeFixSessionId}`);
+      if (!list || !box) return;
+      const items = box.querySelectorAll('.feedback-item');
+      const target = items.length ? items[items.length - 1] : box;
+      target.scrollIntoView({ block: 'end', behavior: 'auto' });
+    }
+
+    function renderFinding(item) {
+      const line = item.line ? `:${item.line}` : '';
+      const severity = item.effective_severity || item.original_severity;
+      const gitlab = item.gitlab_url ? `<div>代码链接: <a href="${item.gitlab_url}" target="_blank" rel="noopener">${item.gitlab_url}</a></div>` : '';
+      const processingTag = item.processing ? '<span class="status-tag processing">模型复核中</span>' : '';
+      return `
+        <div class="finding" data-index="${item.index}">
+          <div>
+            <span class="severity">${severity}</span>
+            <span class="status-tag">${item.status_label}</span>
+            ${processingTag}
+          </div>
+          <div><strong>${escapeHtml(item.title)}</strong></div>
+          <div>位置: <code>${escapeHtml(item.file)}</code>${line}</div>
+          ${gitlab}
+          <p>${escapeHtml(item.detail)}</p>
+          ${item.suggestion ? `<p>建议: ${escapeHtml(item.suggestion)}</p>` : ''}
+          <div class="feedback-actions">
+            <button class="toggle-btn" type="button" onclick="toggleFeedback(${item.index})">展开沟通</button>
+          </div>
+          <div class="feedback-box" id="feedback-box-${item.index}">
+            <div id="feedback-thread-${item.index}">${renderThread(item.thread.messages)}</div>
+            <textarea id="feedback-input-${item.index}" placeholder="请输入你对这个问题的反馈，比如为什么这是误判、为什么应该降级、你希望模型重新关注什么上下文。"></textarea>
+            <div class="feedback-actions">
+              <button class="submit-btn" type="button" onclick="submitFeedback(${item.index})">提交反馈</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function captureUiState() {
+      const expanded = new Set();
+      document.querySelectorAll('.feedback-box').forEach(box => {
+        if (box.style.display === 'block') {
+          const index = box.id.replace('feedback-box-', '');
+          expanded.add(index);
+        }
+      });
+      const drafts = {};
+      document.querySelectorAll('textarea[id^="feedback-input-"]').forEach(input => {
+        const index = input.id.replace('feedback-input-', '');
+        drafts[index] = input.value;
+      });
+      let focus = null;
+      const active = document.activeElement;
+      if (active && active.id && active.id.startsWith('feedback-input-')) {
+        focus = {
+          id: active.id,
+          start: active.selectionStart,
+          end: active.selectionEnd,
+        };
+      }
+      uiState = { expanded, drafts, focus, scrollY: window.scrollY || window.pageYOffset || 0 };
+    }
+
+    function restoreUiState() {
+      uiState.expanded.forEach(index => {
+        const box = document.getElementById(`feedback-box-${index}`);
+        if (box) box.style.display = 'block';
+      });
+      Object.entries(uiState.drafts).forEach(([index, value]) => {
+        const input = document.getElementById(`feedback-input-${index}`);
+        if (input && input.value !== value) {
+          input.value = value;
+        }
+      });
+      if (uiState.focus) {
+        const input = document.getElementById(uiState.focus.id);
+        if (input) {
+          input.focus();
+          if (typeof uiState.focus.start === 'number' && typeof uiState.focus.end === 'number') {
+            input.setSelectionRange(uiState.focus.start, uiState.focus.end);
+          }
+        }
+      } else if (typeof uiState.scrollY === 'number') {
+        window.scrollTo({ top: uiState.scrollY, behavior: 'auto' });
+      }
+    }
+
+    async function loadDetail() {
+      captureUiState();
+      const detail = await fetch(`/reports/${taskId}/detail`, { cache: 'no-store' }).then(r => r.json());
+      latestDetail = detail;
+      document.getElementById('generated-at').textContent = formatShanghaiTime(detail.generated_at) || '-';
+      document.getElementById('summary').textContent = detail.summary;
+      document.getElementById('score').textContent = detail.score;
+      const passCheck = document.getElementById('pass-check');
+      passCheck.textContent = detail.pass_check ? '通过' : '未通过';
+      passCheck.className = detail.pass_check ? 'ok' : 'bad';
+      document.getElementById('findings-root').innerHTML = detail.findings.length
+        ? detail.findings.map(renderFinding).join('')
+        : '<p>未发现问题。</p>';
+      document.getElementById('general-feedback-list').innerHTML = renderGeneralFeedbackList(detail.general_feedbacks || []);
+      refreshFixModal();
+      restoreUiState();
+      if (
+        detail.findings.some(item => item.processing) ||
+        (detail.general_feedbacks || []).some(item => item.processing) ||
+        (detail.fix_sessions || []).some(item => item.processing)
+      ) {
+        scheduleRefresh();
+      }
+    }
+
+    let refreshTimer = null;
+    function scheduleRefresh() {
+      if (refreshTimer) return;
+      refreshTimer = setTimeout(async () => {
+        refreshTimer = null;
+        await loadDetail();
+      }, 3000);
+    }
+
+    function toggleFeedback(index) {
+      const box = document.getElementById(`feedback-box-${index}`);
+      box.style.display = box.style.display === 'block' ? 'none' : 'block';
+      captureUiState();
+    }
+
+    function toggleGeneralFeedbackModal(show) {
+      document.getElementById('general-feedback-modal').style.display = show ? 'block' : 'none';
+    }
+
+    async function submitFeedback(index) {
+      const input = document.getElementById(`feedback-input-${index}`);
+      const message = (input.value || '').trim();
+      if (!message) return;
+      const resp = await fetch(`/reports/${taskId}/findings/${index}/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        alert(text);
+        return;
+      }
+      const payload = await resp.json();
+      input.value = '';
+      captureUiState();
+      alert(payload.message || '已提交大模型，等待回复');
+      await loadDetail();
+      document.getElementById(`feedback-box-${index}`)?.style && (document.getElementById(`feedback-box-${index}`).style.display = 'block');
+      scheduleRefresh();
+    }
+
+    async function submitGeneralFeedback() {
+      const input = document.getElementById('general-feedback-input');
+      const message = (input.value || '').trim();
+      if (!message) return;
+      const resp = await fetch(`/reports/${taskId}/general-feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        alert(text);
+        return;
+      }
+      const payload = await resp.json();
+      input.value = '';
+      alert(payload.message || '已提交漏判反馈，等待大模型复核');
+      await loadDetail();
+      scheduleRefresh();
+    }
+
+    async function submitFixMessage() {
+      const message = (document.getElementById('fix-message-input').value || '').trim();
+      let url = `/reports/${taskId}/fix-sessions`;
+      let payload = { selected_finding_indexes: getSelectedFixIndexes(), message };
+      if (activeFixSessionId) {
+        url = `/reports/${taskId}/fix-sessions/${activeFixSessionId}/messages`;
+        payload = { message };
+      }
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!resp.ok) {
+        alert(await resp.text());
+        return;
+      }
+      const data = await resp.json();
+      if (data.session && data.session.session_id) activeFixSessionId = data.session.session_id;
+      document.getElementById('fix-message-input').value = '';
+      alert(data.message || '已提交大模型，等待回复');
+      await loadDetail();
+      scheduleRefresh();
+    }
+
+    async function confirmFixSession(sessionId) {
+      activeFixSessionId = sessionId;
+      const resp = await fetch(`/reports/${taskId}/fix-sessions/${sessionId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: '确认通过' }),
+      });
+      if (!resp.ok) {
+        alert(await resp.text());
+        return;
+      }
+      await loadDetail();
+    }
+
+    async function retryFixSession(sessionId) {
+      activeFixSessionId = sessionId;
+      const resp = await fetch(`/reports/${taskId}/fix-sessions/${sessionId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: '请基于当前已确认的问题范围和修复目标重新尝试修复。' }),
+      });
+      if (!resp.ok) {
+        alert(await resp.text());
+        return;
+      }
+      const data = await resp.json();
+      alert(data.message || '已提交大模型，等待回复');
+      await loadDetail();
+      scheduleRefresh();
+    }
+
+    document.getElementById('generated-at').textContent = formatShanghaiTime(document.getElementById('generated-at').dataset.value) || '-';
+    loadDetail();
+  </script>
+</body>
+</html>
